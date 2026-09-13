@@ -1,13 +1,17 @@
-import pandas as pd
+from pathlib import Path
+from duckdb_utils import connect, read_csv, write_csv
 
-df = pd.read_csv("draftsheet.csv")
-df1 = pd.read_csv("sleepers.csv")
+BASE = Path(__file__).resolve().parent
 
-df2 = df.merge(
-    df1[["Player", "Sleeper Count", "Overrated Count", "Experts"]],
-    on=["Player"],
-    how="inner",
-)
-df2 = df2.drop_duplicates(subset=["Player", "Rank"], keep="last")
+def main():
+    con = connect()
+    read_csv(con, BASE/"draftsheet.csv", "d")
+    read_csv(con, BASE/"sleepers.csv", "s")
+    write_csv(con, """
+      SELECT DISTINCT d.*, s."Sleeper Count", s."Overrated Count", s."Experts"
+      FROM d INNER JOIN s USING ("Player")
+    """, BASE/"finaldraftsheet.csv")
+    con.close()
 
-df2 = df2.to_csv("finaldraftsheet.csv")
+if __name__ == "__main__":
+    main()

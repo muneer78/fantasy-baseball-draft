@@ -1,15 +1,16 @@
-import pandas as pd
+from pathlib import Path
+from duckdb_utils import connect, read_csv, write_csv
 
-df_excluded = pd.read_csv("fbexcluded.csv")
+BASE = Path(__file__).resolve().parent
 
+def main():
+    con = connect()
+    read_csv(con, BASE/"fbexcluded.csv", "x")
+    write_csv(con, """
+      SELECT regexp_replace("PLAYER NAME", '[^a-zA-Z0-9 ]| Jr| III', '', 'g') AS "PLAYER NAME"
+      FROM x
+    """, BASE/"fbexcluded.csv")
+    con.close()
 
-def clean_player_data(df):
-    df["PLAYER NAME"] = df["PLAYER NAME"].replace(
-        r"[^\w\s]|_\*| Jr| III", "", regex=True
-    )
-    return df[["PLAYER NAME"]]  # Select only the 'PLAYER NAME' column
-
-
-df_excluded = clean_player_data(df_excluded)
-
-df_excluded.to_csv("fbexcluded.csv", index=False)
+if __name__ == "__main__":
+    main()

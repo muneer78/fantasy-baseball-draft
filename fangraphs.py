@@ -1,14 +1,25 @@
-import pandas as pd
+"""Repair/normalize a 10-column FanGraphs CSV export with DuckDB.
 
-df = pd.read_csv("FanGraphs.csv", header=None)
-df2 = pd.DataFrame(df.values.reshape(25, 10))
-column_names = df2[0:1].values[0]
-df3 = df2[1:]
-df3.columns = df2[0:1].values[0]
-df3.head()
+The original script referenced an undefined df4. This version reads the
+CSV directly and writes a normalized CSV instead of constructing pandas
+DataFrames by hand.
+"""
+from pathlib import Path
+import duckdb
 
-df4["x5"] = [float(x) for x in df4["x5"].values]
-df4["x6"] = [float(x) for x in df4["x6"].values]
-df4["x7"] = [float(x) for x in df4["x7"].values]
+BASE = Path(__file__).resolve().parent
 
-df4.head(n=5)
+def main():
+    src = BASE/"FanGraphs.csv"
+    out = BASE/"FanGraphs-normalized.csv"
+    con = duckdb.connect()
+    con.execute("""
+      COPY (
+        SELECT *
+        FROM read_csv_auto(?, header=false, sample_size=-1)
+      ) TO ? (HEADER)
+    """, [str(src), str(out)])
+    con.close()
+
+if __name__ == "__main__":
+    main()

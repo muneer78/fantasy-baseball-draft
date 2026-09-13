@@ -1,19 +1,19 @@
-import pandas as pd
+from pathlib import Path
+import sys
+import duckdb
 
-# Step 1: Create a dataframe from the list
-data = pd.read_csv
+BASE = Path(__file__).resolve().parent
 
-# Define column names
-columns = ["Round", "Player", "Position", "Time Frame", "When To Drop"]
+def main():
+    src = Path(sys.argv[1]) if len(sys.argv) > 1 else BASE/"player-drop-dates.csv"
+    con = duckdb.connect()
+    print(con.execute("""
+      SELECT *,
+        CAST(date '2024-04-01' + CAST("Time Frame" AS INTEGER) * INTERVAL 1 DAY AS DATE)
+          AS "When To Drop"
+      FROM read_csv_auto(?, header=true)
+    """, [str(src)]).df().to_string(index=False))
+    con.close()
 
-# Create the dataframe
-df = pd.DataFrame(data, columns=columns)
-
-# Step 2: Set the season start date for MLB season to 4/1/24
-season_start_date = pd.to_datetime("2024-04-01")
-
-# Step 3: Add values in Time Frame column to Season Start Date variable
-df["When To Drop"] = season_start_date + pd.to_timedelta(df["Time Frame"], unit="D")
-
-# Display the updated dataframe
-print(df)
+if __name__ == "__main__":
+    main()

@@ -1,118 +1,177 @@
-import pandas as pd
-from scipy import stats
-import numpy as np
+from pathlib import Path
+import duckdb
+from duckdb_utils import connect, read_csv, write_csv, qi, normalize_name_sql, zscore_select
 
-df = pd.read_csv("pitcher.csv", index_col=["playerid"])  # Preseason Pitchers
+BASE = Path(__file__).resolve().parent
 
-expr1 = (
-    (df["GS"] / (df["ER"] * (df["GS"] / df["G"])))
-    .fillna(0)
-    .replace([np.inf, -np.inf], 0)
-)
-expr2 = (df["IP"] * (df["GS"] / df["G"])).fillna(0)
-expr3 = (((df["GS"] + df["G"]) / (2 * df["G"])) ** 2).fillna(0)
-expr4 = expr1 * expr2 * expr3
-df["ER"] = df["ER"] * -1
-df["EstimatedQS"] = expr4
-df = df.drop(["ER", "GS", "G"], axis=1)
+def main():
+    con = connect()
 
-df["F-Strike%"] = df["F-Strike%"].str.rstrip("%").astype("float")
-df["Barrel%"] = df["Barrel%"].str.rstrip("%").astype("float")
-df["CSW%"] = df["CSW%"].str.rstrip("%").astype("float")
-df["SwStr%"] = df["SwStr%"].str.rstrip("%").astype("float")
-df["HardHit%"] = df["HardHit%"].str.rstrip("%").astype("float")
-df["Barrel%"] = df["Barrel%"] * -1
+    # Pitcher z-scores.  Keep the same scoring weights as the original script,
+    # but do the parsing, window statistics and arithmetic inside DuckDB.
+    read_csv(con, BASE / "pitcher.csv", "pitchers_raw")
+    pitcher_numeric = """
+        try_cast(regexp_replace("F-Strike%", '%', '', 'g') AS DOUBLE) AS "F-Strike%",
+        try_cast(regexp_replace("Barrel%", '%', '', 'g') AS DOUBLE) AS "Barrel%",
+        try_cast(regexp_replace("CSW%", '%', '', 'g') AS DOUBLE) AS "CSW%",
+        try_cast(regexp_replace("SwStr%", '%', '', 'g') AS DOUBLE) AS "SwStr%",
+        try_cast(regexp_replace("HardHit%", '%', '', 'g') AS DOUBLE) AS "HardHit%"
+    """
+    con.execute(f"""
+        CREATE OR REPLACE VIEW pitchers AS
+        SELECT *,
+          CASE WHEN coalesce("G",0)=0 OR coalesce("ER",0)=0 THEN 0
+               ELSE ("GS" / ("ER" * ("GS"/"G"))) *
+                    ("IP" * ("GS"/"G")) *
+                    power(("GS"+"G")/(2.0*"G"), 2)
+          END AS "EstimatedQS",
+          {pitcher_numeric}
+        FROM pitchers_raw
+    """)
+    # Replace the string percentage columns with parsed values.
+    con.execute("""
+        CREATE OR REPLACE VIEW pitcher_clean AS
+        SELECT * EXCLUDE ("F-Strike%", "Barrel%", "CSW%", "SwStr%", "HardHit%")
+        REPLACE (
+          "F-Strike%" AS "F-Strike%",
+          "Barrel%" AS "Barrel%",
+          "CSW%" AS "CSW%",
+          "SwStr%" AS "SwStr%",
+          "HardHit%" AS "HardHit%"
+        )
+        FROM pitchers
+    """)
+    # DuckDB cannot conveniently mutate a view in place, so explicitly project
+    # the scored columns.
+    cols = [r[0] for r in con.execute("DESCRIBE pitcher_clean").fetchall()]
+    exclude = {"ER", "GS", "G", "playerid"}
+    numeric = []
+    for c in cols:
+        typ = con.execute(f'DESCRIBE pitcher_clean').fetchall()
+    numeric = [c for c in cols if c not in {"playerid", "Name"}]
+    # Use a whitelist based on runtime types.
+    desc = {r[0]: r[1].upper() for r in con.execute("DESCRIBE pitcher_clean").fetchall()}
+    numeric = [c for c,t in desc.items() if c not in exclude and any(x in t for x in ("INT","FLOAT","DOUBLE","DECIMAL","REAL"))]
+    exprs = []
+    for c in cols:
+        if c in {"ER","GS","G"}:
+            continue
+        if c in numeric:
+            exprs.append(
+                f"CASE WHEN stddev_pop({qi(c)}) OVER () IS NULL OR stddev_pop({qi(c)}) OVER ()=0 "
+                f"THEN 0 ELSE ({qi(c)}-avg({qi(c)}) OVER())/stddev_pop({qi(c)}) OVER() END AS {qi(c)}"
+            )
+        else:
+            exprs.append(qi(c))
+    scored = ", ".join(exprs)
+    con.execute(f"""
+        CREATE OR REPLACE VIEW zpitchers AS
+        SELECT {scored}
+        FROM pitcher_clean
+    """)
+    # Apply scoring weights and sum only numeric scored fields.
+    desc = {r[0]: r[1].upper() for r in con.execute("DESCRIBE zpitchers").fetchall()}
+    numeric2 = [c for c,t in desc.items() if any(x in t for x in ("INT","FLOAT","DOUBLE","DECIMAL","REAL"))]
+    weighted = []
+    for c in numeric2:
+        factor = 1
+        if c in {"SV","Barrel%","xFIP-","SwStr%","F-Strike%","CSW%"}: factor = 1.5
+        if c in {"K%+","BB%+","EstimatedQS"}: factor = 5
+        weighted.append(f"{qi(c)} * {factor}")
+    score_expr = " + ".join(weighted) if weighted else "0"
+    write_csv(con, f"""
+        SELECT *, round(({score_expr}), 2) AS "Total Z-Score"
+        FROM zpitchers
+        ORDER BY "Total Z-Score" DESC
+    """, BASE / "ZPitchers.csv")
 
-numbers = df.select_dtypes(include="number").columns
-df[numbers] = df[numbers].apply(stats.zscore)
-df["SV"] = df["SV"] * 1.5
-df["Barrel%"] = df["Barrel%"] * 1.5
-df["xFIP-"] = df["xFIP-"] * 1.5
-df["SwStr%"] = df["SwStr%"] * 1.5
-df["F-Strike%"] = df["F-Strike%"] * 1.5
-df["CSW%"] = df["CSW%"] * 1.5
-df["K%+"] = df["K%+"] * 5
-df["BB%+"] = df["BB%+"] * 5
-df["EstimatedQS"] = df["EstimatedQS"] * 5
+    # Hitters.
+    read_csv(con, BASE / "hitter.csv", "hitters_raw")
+    con.execute("""
+        CREATE OR REPLACE VIEW hitters_clean AS
+        SELECT * EXCLUDE ("Barrel%")
+        REPLACE (try_cast(regexp_replace("Barrel%", '%', '', 'g') AS DOUBLE) AS "Barrel%")
+        FROM hitters_raw
+    """)
+    desc = {r[0]: r[1].upper() for r in con.execute("DESCRIBE hitters_clean").fetchall()}
+    numeric = [c for c,t in desc.items() if c.lower() != "playerid" and any(x in t for x in ("INT","FLOAT","DOUBLE","DECIMAL","REAL"))]
+    exprs = []
+    for c in [r[0] for r in con.execute("DESCRIBE hitters_clean").fetchall()]:
+        if c in numeric:
+            exprs.append(
+                f"CASE WHEN stddev_pop({qi(c)}) OVER () IS NULL OR stddev_pop({qi(c)}) OVER ()=0 "
+                f"THEN 0 ELSE ({qi(c)}-avg({qi(c)}) OVER())/stddev_pop({qi(c)}) OVER() END AS {qi(c)}"
+            )
+        else:
+            exprs.append(qi(c))
+    con.execute(f"CREATE OR REPLACE VIEW zhitters AS SELECT {', '.join(exprs)} FROM hitters_clean")
+    desc = {r[0]: r[1].upper() for r in con.execute("DESCRIBE zhitters").fetchall()}
+    numeric = [c for c,t in desc.items() if any(x in t for x in ("INT","FLOAT","DOUBLE","DECIMAL","REAL"))]
+    score = " + ".join(qi(c) for c in numeric) if numeric else "0"
+    write_csv(con, f"""
+        SELECT *, round(({score}), 2) AS "Total Z-Score"
+        FROM zhitters
+        ORDER BY "Total Z-Score" DESC
+    """, BASE / "ZHitters.csv")
 
-df["Total Z-Score"] = df.sum(axis=1)
+    # Final draft sheet: keep all joins in DuckDB and avoid repeated CSV round trips.
+    for fn, view in [
+        ("fg2.csv","fgpit"), ("stuffplus.csv","stuff"), ("adp.csv","adp"),
+        ("ZPitchers.csv","zpit"), ("ZHitters.csv","zhit"),
+        ("fg.csv","fghit"), ("laghezza.csv","laghezza")
+    ]:
+        read_csv(con, BASE / fn, view)
 
-rounded_df = df.round(decimals=2).sort_values(by="Total Z-Score", ascending=False)
+    # Name-key views.
+    con.execute(f"""
+        CREATE OR REPLACE VIEW adp_k AS
+        SELECT *, {normalize_name_sql('"Player"')} AS "Key" FROM adp
+    """)
+    for view, namecol in [
+        ("fgpit","Name"),("stuff","player_name"),("zpit","Name"),
+        ("zhit","Name"),("fghit","Name"),("laghezza","Name")
+    ]:
+        con.execute(f"""
+            CREATE OR REPLACE VIEW {view}_k AS
+            SELECT *, {normalize_name_sql(qi(namecol))} AS "Key" FROM {view}
+        """)
+    con.execute("""
+        CREATE OR REPLACE VIEW draft_join AS
+        SELECT
+          a.* EXCLUDE ("ESPN","CBS","RTS","NFBC","FT"),
+          f.* EXCLUDE ("Key"),
+          s."STUFFplus", s."LOCATIONplus", s."PITCHINGplus",
+          p."Total Z-Score" AS "Pitcher Z",
+          h."Total Z-Score" AS "Hitter Z",
+          l."LaghezzaRank"
+        FROM adp_k a
+        LEFT JOIN fgpit_k f USING ("Key")
+        LEFT JOIN stuff_k s USING ("Key")
+        LEFT JOIN zpit_k p USING ("Key")
+        LEFT JOIN zhit_k h USING ("Key")
+        LEFT JOIN fghit_k fh USING ("Key")
+        LEFT JOIN laghezza_k l USING ("Key")
+    """)
+    # Prefer pitcher z-score when present, otherwise hitter z-score.
+    write_csv(con, """
+        WITH x AS (
+          SELECT *,
+            coalesce(nullif("Pitcher Z", 0), "Hitter Z", 0) AS "Total Z-Score",
+            coalesce(nullif(try_cast("LaghezzaRank" AS DOUBLE), 0), try_cast("Rank" AS DOUBLE)) AS "LaghezzaRank2"
+          FROM draft_join
+        )
+        SELECT
+          "Player", "Team", "Total Z-Score",
+          try_cast("Rank" AS DOUBLE) AS "ADP",
+          "LaghezzaRank2" AS "LaghezzaRank",
+          try_cast("Rank" AS DOUBLE) - "LaghezzaRank2" AS "RankDiff"
+        FROM x
+        QUALIFY row_number() OVER (
+          PARTITION BY "Player", "Rank" ORDER BY "Player"
+        ) = 1
+    """, BASE / "draftsheet.csv")
 
-rounded_df.to_csv("ZPitchers.csv")
+    con.close()
 
-df = pd.read_csv("hitter.csv", index_col=["playerid"])  # Preseason Hitters
-
-df["Barrel%"] = df["Barrel%"] = df["Barrel%"].str.rstrip("%").astype("float")
-
-filter = df[(df["PA"] > 250) & (df["HR"] > 5)]
-
-numbers = df.select_dtypes(include="number").columns
-df[numbers] = df[numbers].apply(stats.zscore)
-
-df["Total Z-Score"] = df.sum(axis=1)
-
-rounded_df = df.round(decimals=2).sort_values(by="Total Z-Score", ascending=False)
-
-rounded_df.to_csv("ZHitters.csv")
-
-dffgpit = pd.read_csv("fg2.csv")
-dfstuff = pd.read_csv("stuffplus.csv")
-dfadp = pd.read_csv("adp.csv")
-dfzpit = pd.read_csv("ZPitchers.csv")
-dfzhit = pd.read_csv("ZHitters.csv")
-dffghit = pd.read_csv("fg.csv")
-dflaghezza = pd.read_csv("laghezza.csv")
-
-dflist = [dffgpit, dfzpit, dfzhit, dfadp, dfstuff, dffghit, dflaghezza]
-for index in range(len(dflist)):
-    dflist[index].replace(r"[^\w\s]|_\*", "", regex=True, inplace=True)
-    dflist[index].replace(" Jr", "", regex=True, inplace=True)
-    dflist[index].replace(" II", "", regex=True, inplace=True)
-
-dfadp = dfadp.astype(str)
-
-func = lambda x: "".join([i[:3] for i in x.strip().split(" ")])
-dffgpit["Key"] = dffgpit.Name.apply(func)
-dfstuff["Key"] = dfstuff.player_name.apply(func)
-dfadp["Key"] = dfadp.Player.apply(func)
-dfzpit["Key"] = dfzpit.Name.apply(func)
-dfzhit["Key"] = dfzhit.Name.apply(func)
-dffghit["Key"] = dffghit.Name.apply(func)
-dflaghezza["Key"] = dflaghezza.Name.apply(func)
-
-dflist2 = [dffgpit, dfzpit, dfadp, dfstuff]
-for index in range(len(dflist2)):
-    dflist2[index].columns.str.strip()
-
-dfadp = dfadp.drop(["ESPN", "CBS", "RTS", "NFBC", "FT"], axis=1)
-
-df1 = (
-    dfadp.merge(dffgpit, on=["Key"], how="left")
-    .merge(
-        dfstuff[["Key", "STUFFplus", "LOCATIONplus", "PITCHINGplus"]],
-        on=["Key"],
-        how="left",
-    )
-    .merge(dfzpit[["Key", "Total Z-Score"]], on=["Key"], how="left")
-    .merge(dfzhit[["Key", "Total Z-Score"]], on=["Key"], how="left")
-    .merge(dffghit, on=["Key"], how="left")
-    .merge(dflaghezza[["Key", "LaghezzaRank"]], on=["Key"], how="left")
-)
-df1 = df1.fillna(value=0)
-
-cols = ["Rank", "LaghezzaRank"]
-df1[cols] = df1[cols] = df1[cols].apply(pd.to_numeric, errors="coerce", axis=1)
-
-df1 = df1.drop_duplicates(subset=["Player", "Rank"], keep="last")
-df1["Total Z-Score"] = df1["Total Z-Score_x"].mask(
-    df1["Total Z-Score_x"].eq(0), df1["Total Z-Score_y"]
-)
-df1["RankDiff"] = df1["Rank"] - df1["LaghezzaRank"]
-df1.to_csv("fulldraftsheet.csv")
-
-df2 = pd.read_csv("fulldraftsheet.csv")
-
-columns = ["Player", "Total Z-Score", "Rank", "LaghezzaRank", "RankDiff"]
-df2 = pd.DataFrame(df2, columns=columns)
-df2.to_csv("draftsheet.csv")
+if __name__ == "__main__":
+    main()

@@ -1,17 +1,20 @@
-"""
-Downlaad team batting stats as csv from Baseball Reference
-"""
+from pathlib import Path
+from duckdb_utils import connect, read_csv, write_csv
 
-import pandas as pd
+BASE = Path(__file__).resolve().parent
 
-df = pd.read_csv("mlbbat.csv")
+def main():
+    con = connect()
+    read_csv(con, BASE/"mlbbat.csv", "d")
+    write_csv(con, """
+      SELECT
+        rank() OVER (ORDER BY (TB + BB) / 4 DESC) AS Rank,
+        Tm, BatAge, "R/G",
+        cast((TB + BB) / 4 AS INTEGER) AS OffenseCreated
+      FROM d
+      ORDER BY OffenseCreated DESC
+    """, BASE/"mlb-team-offense-ranks.csv")
+    con.close()
 
-df["OffenseCreated"] = (df["TB"] + df["BB"]) / 4
-df["Rank"] = df["OffenseCreated"].rank(ascending=False)
-cols = ["Rank", "OffenseCreated"]
-df[cols] = df[cols].applymap(int)
-
-sorted_df = df[["Rank", "Tm", "BatAge", "R/G", "OffenseCreated"]]
-sorted_df = sorted_df.sort_values(by="OffenseCreated", ascending=False)
-
-print(sorted_df)
+if __name__ == "__main__":
+    main()
